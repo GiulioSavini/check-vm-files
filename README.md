@@ -1,12 +1,12 @@
 # check_vm_files.py
 
-**Icinga / NetEye monitoring plugin** per il conteggio dei file VMDK e snapshot presenti nella cartella datastore di una VM specifica, tramite vCenter API (pyVmomi).
+**Icinga / NetEye monitoring plugin** per il conteggio dei file VMDK e snapshot presenti su **tutti i datastore** di una VM specifica, tramite vCenter API (pyVmomi).
 
 ---
 
 ## Panoramica
 
-Lo script conta i file presenti nella directory di una VM su datastore, utile per:
+Lo script conta i file presenti nelle directory di una VM su **tutti i datastore associati**, utile per:
 
 - **Rilevare accumulo di snapshot** non consolidati (file `*-0000*.vmdk`, `*.vmsn`, `*.vmsd`, `*.delta.vmdk`)
 - **Monitorare il numero di dischi VMDK** per individuare crescita anomala o file orfani
@@ -14,8 +14,12 @@ Lo script conta i file presenti nella directory di una VM su datastore, utile pe
 
 | Modalita' | Cosa conta | Use case |
 |---|---|---|
-| **allfiles** (default) | Tutti i file `*.vmdk` nella cartella VM | Conteggio dischi totali |
+| **allfiles** (default) | Tutti i file `*.vmdk` su tutti i datastore della VM | Conteggio dischi totali |
 | **snaponly** (`--snaponly`) | Solo file snapshot (`*-0000*.vmdk`, `*.vmsn`, `*.vmsd`, `*.delta.vmdk`) | Rilevamento snapshot non consolidati |
+
+### Supporto multi-datastore
+
+Una VM puo' avere i propri file distribuiti su datastore diversi (es. VMX su un datastore SSD, dischi dati su SATA, snapshot su un terzo). Lo script scansiona **automaticamente tutti i datastore** associati alla VM (`vm.datastore`) e riporta il dettaglio per ciascuno nell'output.
 
 ---
 
@@ -110,9 +114,14 @@ check_vm_files.py -H <vcenter> -u <user> -p <password> -v <vm_name> [opzioni]
 ./check_vm_files.py -H <VCENTER_HOST> -u <USERNAME> -p '<PASSWORD>' -v myserver01
 ```
 
-Output:
+Output (VM su singolo datastore):
 ```
-OK - files=4 vm='myserver01' ds='datastore1' path='[datastore1] myserver01' mode=allfiles scope=folder | files=4;0;40;0;
+OK - files=4 vm='myserver01' datastores=1 [datastore-ssd=4] mode=allfiles scope=folder | files=4;0;40;0;
+```
+
+Output (VM su piu' datastore):
+```
+OK - files=8 vm='myserver01' datastores=3 [datastore-ssd=2, datastore-sata=4, datastore-nfs=2] mode=allfiles scope=folder | files=8;0;40;0;
 ```
 
 ### Check solo snapshot con soglie personalizzate
@@ -128,9 +137,9 @@ OK - files=4 vm='myserver01' ds='datastore1' path='[datastore1] myserver01' mode
   -c 20
 ```
 
-Output (WARNING - 7 file snapshot trovati):
+Output (WARNING - 7 file snapshot trovati su 2 datastore):
 ```
-WARNING - files=7 vm='myserver01' ds='datastore1' path='[datastore1] myserver01' mode=snaponly scope=folder | files=7;5;20;0;
+WARNING - files=7 vm='myserver01' datastores=2 [datastore-ssd=3, datastore-sata=4] mode=snaponly scope=folder | files=7;5;20;0;
 ```
 
 ### Check ricorsivo nelle sottocartelle
@@ -147,7 +156,7 @@ WARNING - files=7 vm='myserver01' ds='datastore1' path='[datastore1] myserver01'
 ### Esempio output CRITICAL
 
 ```
-CRITICAL - files=53 vm='myserver01' ds='datastore1' path='[datastore1] myserver01' mode=allfiles scope=folder | files=53;0;40;0;
+CRITICAL - files=53 vm='myserver01' datastores=2 [datastore-ssd=13, datastore-sata=40] mode=allfiles scope=folder | files=53;0;40;0;
 ```
 
 ### Esempio output UNKNOWN - VM non trovata
@@ -164,9 +173,11 @@ Lo script emette perfdata compatibili con Icinga/Nagios dopo il pipe `|`:
 
 | Metrica | Formato | Descrizione |
 |---|---|---|
-| `files` | `files=<count>;<warn>;<crit>;0;` | Numero di file trovati, con soglie WARNING e CRITICAL |
+| `files` | `files=<count>;<warn>;<crit>;0;` | Numero **totale** di file trovati su tutti i datastore, con soglie WARNING e CRITICAL |
 
 La perfdata segue il formato standard Nagios: `label=value;warn;crit;min;max`
+
+L'output testuale include il dettaglio per datastore (es. `[datastore-ssd=3, datastore-sata=4]`) per facilitare il troubleshooting.
 
 ---
 
@@ -176,26 +187,36 @@ La perfdata segue il formato standard Nagios: `label=value;warn;crit;min;max`
 
 ```
 check_vm_files.py
-├── get_args()            # Parsing argomenti CLI
-├── find_vm_by_name()     # Cerca VM per nome esatto tramite ContainerView
-├── parse_vm_path()       # Parsa "[datastore] folder/vm.vmx" -> (ds_name, folder)
-├── wait_task()           # Attende completamento task asincrono vSphere
+├── get_args()              # Parsing argomenti CLI
+├── find_vm_by_name()       # Cerca VM per nome esatto tramite ContainerView
+├── parse_vm_path()         # Parsa "[datastore] folder/vm.vmx" -> (ds_name, folder)
+├── wait_task()             # Attende completamento task asincrono vSphere
+├── browse_datastore()      # Browse singolo datastore, ritorna conteggio file
+├── get_vm_folder_name()    # Raccoglie TUTTI i folder name da vmPathName + layoutEx
 └── main()
     ├── Connessione al vCenter (SmartConnect)
     ├── Ricerca VM per nome
-    ├── Parsing vmPathName per identificare datastore e cartella
-    ├── Risoluzione oggetto Datastore
-    ├── Browse datastore (SearchDatastore_Task o SearchDatastoreSubFolders_Task)
-    ├── Conteggio file
-    └── Valutazione soglie e output
+    ├── Raccolta folder names da vmPathName e layoutEx.file
+    ├── Iterazione su TUTTI i datastore della VM (vm.datastore)
+    ├── Browse di ogni datastore per ogni folder name
+    ├── Somma conteggi
+    └── Valutazione soglie e output con dettaglio per-datastore
 ```
 
-### Come funziona il rilevamento della cartella VM
+### Come funziona la scansione multi-datastore
 
-1. Lo script legge `vm.config.files.vmPathName` (es: `[datastore1] myserver01/myserver01.vmx`)
-2. Estrae il **nome del datastore** e il **percorso della cartella** dalla stringa
-3. Risolve l'oggetto `vim.Datastore` corrispondente (prima tra i datastore della VM, poi fallback globale)
-4. Usa il `DatastoreBrowser` per cercare i file nella cartella
+1. Lo script raccoglie i nomi delle cartelle VM da **due fonti**:
+   - `vm.config.files.vmPathName` (cartella principale del VMX)
+   - `vm.layoutEx.file` (elenco completo di tutti i file della VM, include file su altri datastore)
+2. Itera su **tutti i datastore** in `vm.datastore`
+3. Per ogni datastore, cerca le cartelle trovate al punto 1
+4. Se una cartella non esiste su un datastore, viene ignorata silenziosamente (`FileNotFound`)
+5. I conteggi vengono sommati e riportati con dettaglio per-datastore
+
+Questo approccio copre scenari come:
+- **Storage DRS** che sposta dischi tra datastore
+- **Dischi su datastore diversi** per motivi di performance (es. SSD per OS, SATA per dati)
+- **Snapshot delta** che finiscono su datastore differenti
 
 ### Pattern di ricerca
 
@@ -217,14 +238,18 @@ check_vm_files.py
 
 | Opzione | Metodo API | Comportamento |
 |---|---|---|
-| default | `SearchDatastore_Task` | Cerca solo nella cartella principale della VM |
-| `--recursive` | `SearchDatastoreSubFolders_Task` | Cerca anche in tutte le sottocartelle |
-
-La ricerca ricorsiva e' utile quando i file della VM sono distribuiti su piu' sottocartelle dello stesso datastore.
+| default | `SearchDatastore_Task` | Cerca solo nella cartella principale della VM (per ogni datastore) |
+| `--recursive` | `SearchDatastoreSubFolders_Task` | Cerca anche in tutte le sottocartelle (per ogni datastore) |
 
 ### Gestione task asincroni
 
 Il browse del datastore e' un'operazione asincrona in vSphere. Lo script usa `wait_task()` che effettua polling ogni 200ms sullo stato del task fino al completamento o errore.
+
+### Gestione errori per-datastore
+
+Se un datastore non e' accessibile o non contiene la cartella della VM:
+- `FileNotFound` → conteggio 0 per quel datastore (normale per VM multi-datastore)
+- Altri errori → riportati nel campo `errors` dell'output, non bloccano il check
 
 ---
 
