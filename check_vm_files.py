@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import ssl
 import sys
+import time
 import atexit
 import argparse
 from pyVim.connect import SmartConnect, Disconnect
@@ -30,16 +31,15 @@ def find_vm_by_name(content, name: str):
     return None
 
 def parse_vm_path(vm_path_name: str):
-    # Example: "[datastore1] folder/vm.vmx"
+    """Parse '[datastore1] folder/vm.vmx' -> ('datastore1', 'folder')"""
     if not vm_path_name or not vm_path_name.startswith("[") or "]" not in vm_path_name:
         raise ValueError(f"Unexpected vmPathName format: {vm_path_name!r}")
     ds = vm_path_name[1:vm_path_name.index("]")]
-    rest = vm_path_name[vm_path_name.index("]")+1:].strip()  # "folder/vm.vmx"
+    rest = vm_path_name[vm_path_name.index("]")+1:].strip()
     if "/" not in rest:
-        # VMX at datastore root
         folder = ""
     else:
-        folder = rest.rsplit("/", 1)[0]  # "folder"
+        folder = rest.rsplit("/", 1)[0]
     return ds, folder
 
 def wait_task(task):
@@ -49,9 +49,60 @@ def wait_task(task):
             return task.info.result
         if state == vim.TaskInfo.State.error:
             raise task.info.error
-        # ESXi/vCenter tasks update quickly; no need for long sleep
-        import time
         time.sleep(0.2)
+
+def browse_datastore(browser, ds_name, folder, spec, recursive):
+    """Browse a single datastore for matching files. Returns count."""
+    if folder:
+        ds_path = f"[{ds_name}] {folder}"
+    else:
+        ds_path = f"[{ds_name}]"
+
+    try:
+        if recursive:
+            task = browser.SearchDatastoreSubFolders_Task(datastorePath=ds_path, searchSpec=spec)
+            results = wait_task(task) or []
+            count = 0
+            for r in results:
+                if getattr(r, "file", None):
+                    count += len(r.file)
+            return count
+        else:
+            task = browser.SearchDatastore_Task(datastorePath=ds_path, searchSpec=spec)
+            result = wait_task(task)
+            return len(result.file) if result and getattr(result, "file", None) else 0
+    except vim.fault.FileNotFound:
+        # VM folder does not exist on this datastore - normal for multi-ds VMs
+        return 0
+    except Exception:
+        # Folder not present on this datastore, skip silently
+        return 0
+
+def get_vm_folder_name(vm):
+    """Get the VM folder name from layout files or vmPathName."""
+    # Try to collect all unique datastore paths from the VM layout
+    folders = set()
+
+    # Primary: from vmPathName
+    if vm.config and vm.config.files and vm.config.files.vmPathName:
+        try:
+            _, folder = parse_vm_path(vm.config.files.vmPathName)
+            if folder:
+                folders.add(folder)
+        except ValueError:
+            pass
+
+    # Additional: from layout.file (lists all files across all datastores)
+    if hasattr(vm, 'layoutEx') and vm.layoutEx and vm.layoutEx.file:
+        for f in vm.layoutEx.file:
+            try:
+                _, folder = parse_vm_path(f.name)
+                if folder:
+                    folders.add(folder)
+            except (ValueError, AttributeError):
+                pass
+
+    return folders
 
 def main():
     args = get_args()
@@ -70,69 +121,67 @@ def main():
         print(f"UNKNOWN - VM '{args.vm}' has no vmPathName")
         sys.exit(3)
 
-    try:
-        ds_name, folder = parse_vm_path(vm.config.files.vmPathName)
-    except Exception as e:
-        print(f"UNKNOWN - cannot parse vmPathName: {e}")
+    # Get all folder names used by the VM across datastores
+    vm_folders = get_vm_folder_name(vm)
+    if not vm_folders:
+        # Fallback: use VM name as folder name (common convention)
+        vm_folders = {args.vm}
+
+    # Get all datastores attached to the VM
+    datastores = vm.datastore
+    if not datastores:
+        print(f"UNKNOWN - VM '{args.vm}' has no datastores")
         sys.exit(3)
 
-    # Resolve datastore object by name among VM datastores
-    ds_obj = None
-    for ds in vm.datastore:
-        if ds.summary and ds.summary.name == ds_name:
-            ds_obj = ds
-            break
-    if not ds_obj:
-        # fallback: search globally
-        for ds in content.viewManager.CreateContainerView(content.rootFolder, [vim.Datastore], True).view:
-            if ds.summary and ds.summary.name == ds_name:
-                ds_obj = ds
-                break
-    if not ds_obj:
-        print(f"UNKNOWN - datastore '{ds_name}' not found for VM '{args.vm}'")
-        sys.exit(3)
-
-    browser = ds_obj.browser
-
-    # Build datastore path to VM folder
-    if folder:
-        ds_path = f"[{ds_name}] {folder}"
-    else:
-        ds_path = f"[{ds_name}]"
-
+    # Build search spec
     spec = vim.HostDatastoreBrowserSearchSpec()
     if args.snaponly:
         spec.matchPattern = ["*-0000*.vmdk", "*.vmsn", "*.vmsd", "*.delta.vmdk"]
     else:
         spec.matchPattern = ["*.vmdk"]
 
-    try:
-        if args.recursive:
-            task = browser.SearchDatastoreSubFolders_Task(datastorePath=ds_path, searchSpec=spec)
-            results = wait_task(task) or []
-            count = 0
-            for r in results:
-                if getattr(r, "file", None):
-                    count += len(r.file)
-        else:
-            task = browser.SearchDatastore_Task(datastorePath=ds_path, searchSpec=spec)
-            result = wait_task(task)
-            count = len(result.file) if result and getattr(result, "file", None) else 0
-    except Exception as e:
-        print(f"UNKNOWN - datastore browse failed: {e}")
-        sys.exit(3)
+    # Browse ALL datastores for VM files
+    total_count = 0
+    ds_details = []
+    errors = []
+
+    for ds in datastores:
+        ds_name = ds.summary.name if ds.summary else "unknown"
+        try:
+            browser = ds.browser
+        except Exception as e:
+            errors.append(f"{ds_name}: no browser ({e})")
+            continue
+
+        ds_count = 0
+        for folder in vm_folders:
+            ds_count += browse_datastore(browser, ds_name, folder, spec, args.recursive)
+
+        if ds_count > 0:
+            ds_details.append(f"{ds_name}={ds_count}")
+        total_count += ds_count
 
     # Evaluate thresholds
     state = "OK"
     rc = 0
-    if count > args.critical:
+    if total_count > args.critical:
         state, rc = "CRITICAL", 2
-    elif args.warning and count >= args.warning:
+    elif args.warning and total_count >= args.warning:
         state, rc = "WARNING", 1
 
     mode = "snaponly" if args.snaponly else "allfiles"
     scope = "recursive" if args.recursive else "folder"
-    print(f"{state} - files={count} vm='{vm.name}' ds='{ds_name}' path='{ds_path}' mode={mode} scope={scope} | files={count};{args.warning};{args.critical};0;")
+    ds_info = ", ".join(ds_details) if ds_details else "none"
+    ds_count_total = len(datastores)
+
+    msg = (f"{state} - files={total_count} vm='{vm.name}' "
+           f"datastores={ds_count_total} [{ds_info}] "
+           f"mode={mode} scope={scope}")
+    if errors:
+        msg += f" errors=[{', '.join(errors)}]"
+    msg += f" | files={total_count};{args.warning};{args.critical};0;"
+
+    print(msg)
     sys.exit(rc)
 
 if __name__ == "__main__":
